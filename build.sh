@@ -14,6 +14,8 @@ fi
 mkdir -p "$ROOT/build"
 xcrun swiftc -O -swift-version 5 \
   -framework AppKit \
+  -framework CoreLocation \
+  -framework MapKit \
   -o "$ROOT/build/postcard" \
   "$ROOT/Sources/main.swift"
 

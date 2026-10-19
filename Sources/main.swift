@@ -7,8 +7,10 @@
 // until the next day. Every update is idempotent.
 
 import AppKit
+import CoreLocation
 import Foundation
 import ImageIO
+import MapKit
 
 // MARK: - Constants
 
@@ -90,6 +92,7 @@ struct ImageInfo: Codable {
     var latitude: Double? = nil
     var longitude: Double? = nil
     var caption: String? = nil     // e.g. "Grand Canal in Venice, Italy"
+    var countryCode: String? = nil // looked up from the coordinates when the caption doesn't say
 
     /// What's in the photo: the caption, or "Grand Canal in Venice, Italy (© …)" without the credit.
     var subject: String {
@@ -421,12 +424,55 @@ func saveInfo(for images: [DailyImage], resolution: String, market: String?) {
     if info.values.contains(where: { $0.about == nil }) {
         enrich(&info, images: images, resolution: resolution, market: market)
     }
-    let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys]
-    try? e.encode(info).write(to: infoFile, options: .atomic)
+    writeInfo(info)
 }
 
 func info(for file: String) -> ImageInfo {
     loadInfo()[file] ?? ImageInfo(startdate: String(file.prefix(8)), title: nil, copyright: nil, link: nil)
+}
+
+func writeInfo(_ info: [String: ImageInfo]) {
+    let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try? e.encode(info).write(to: infoFile, options: .atomic)
+}
+
+// MARK: - Country
+
+/// English country names (and a few common alternatives) -> ISO code.
+let countryCodes: [String: String] = {
+    let en = Locale(identifier: "en_US")
+    var map: [String: String] = [:]
+    for region in Locale.Region.isoRegions where region.identifier.count == 2 {
+        if let name = en.localizedString(forRegionCode: region.identifier) { map[name.lowercased()] = region.identifier }
+    }
+    let aliases = ["usa": "US", "u.s.": "US", "united states of america": "US",
+                   "england": "GB", "scotland": "GB", "wales": "GB", "northern ireland": "GB", "uk": "GB",
+                   "czech republic": "CZ", "turkey": "TR", "holland": "NL", "ivory coast": "CI",
+                   "burma": "MM", "swaziland": "SZ", "the netherlands": "NL", "the bahamas": "BS"]
+    map.merge(aliases) { old, _ in old }
+    return map
+}()
+
+extension ImageInfo {
+    /// ISO country code: named at the end of the caption or place ("…, Croatia"), else looked up.
+    var country: String? {
+        for text in [caption, place, subject].compactMap({ $0 }) {
+            for part in text.components(separatedBy: ",").reversed() {
+                if let code = countryCodes[part.trimmingCharacters(in: .whitespaces).lowercased()] { return code }
+            }
+        }
+        return countryCode
+    }
+}
+
+/// "HR" -> "🇭🇷"
+func flag(_ code: String) -> String {
+    String(String.UnicodeScalarView(code.uppercased().unicodeScalars.compactMap { UnicodeScalar(127397 + $0.value) }))
+}
+
+/// "HR" -> "Croatia", in the user's language.
+func countryName(_ code: String) -> String {
+    Locale.current.localizedString(forRegionCode: code) ?? code
 }
 
 /// "20261019" -> "19 Oct 2026" in the user's locale.
@@ -513,6 +559,7 @@ func showStatus() -> Int32 {
         print("File:      \(imagesDir.appendingPathComponent(s.file).path)")
         if let sel = s.selected { print("Showing:   \(sel)  (postcard --today to go back)") }
         let i = info(for: s.shownFile)
+        if let code = i.country { print("Country:   \(flag(code)) \(countryName(code))") }
         if let place = i.place, let lat = i.latitude, let lon = i.longitude {
             print("Location:  \(place)  (\(lat), \(lon))")
         }
@@ -680,6 +727,15 @@ final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// The menu card: mostly opaque, so the wallpaper behind the menu doesn't wash out the text.
+final class CardView: NSView {
+    override var isFlipped: Bool { true }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {   // called again when light/dark mode changes
+        layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.94).cgColor
+    }
+}
+
 final class MenuBar: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let options: Options
@@ -707,7 +763,13 @@ final class MenuBar: NSObject, NSMenuDelegate {
         menu.removeAllItems()
         let m = NSMenuItem()
         if let s = loadState() {
-            m.view = card(for: s)
+            // Same size for every photo: as tall as the tallest one you can browse to.
+            let tallest = history(s).map { file -> CGFloat in
+                var other = s
+                other.selected = file == s.file ? nil : file
+                return card(for: other).frame.height
+            }.max()
+            m.view = card(for: s, height: tallest)
         } else {
             let (field, h) = text(NSAttributedString(string: "Waiting for today's photo…",
                                   attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor]))
@@ -727,13 +789,15 @@ final class MenuBar: NSObject, NSMenuDelegate {
 
     /// Photo with title over it, date and credit, location, description, controls and footer.
     /// Laid out top to bottom by hand; menus don't play well with Auto Layout.
-    private func card(for s: State) -> NSView {
+    /// With `height`, the bottom row is pinned to the bottom so the card is exactly that tall.
+    private func card(for s: State, height: CGFloat? = nil) -> NSView {
         let shown = s.shownFile
         let i = info(for: shown)
         let images = history(s)
         let pos = images.firstIndex(of: shown)
         let isToday = shown == s.file
-        let view = FlippedView(frame: .zero)
+        let view = CardView(frame: .zero)
+        view.wantsLayer = true
         var y: CGFloat = 10
 
         // 1. The photo, with the headline and title on a soft gradient.
@@ -803,21 +867,45 @@ final class MenuBar: NSObject, NSMenuDelegate {
         }
         y = place(text(meta, lines: 1), in: view, y: y, gap: 6)
 
-        // 3. Location.
-        if let placeName = i.place {
-            let row = NSMutableAttributedString()
-            if let pin = NSImage(systemSymbolName: "mappin.circle.fill", accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold)
-                    .applying(.init(paletteColors: [.white, .systemRed]))) {
-                let a = NSTextAttachment()
-                a.image = pin
-                a.bounds = CGRect(x: 0, y: -2, width: pin.size.width, height: pin.size.height)
-                row.append(NSAttributedString(attachment: a))
-                row.append(NSAttributedString(string: " "))
+        // 3. Country, with a Maps button at the end (the place itself is already in the title):
+        //    🇭🇷 Croatia                                        [Show in Maps]
+        if i.country == nil, i.latitude != nil { lookUpCountry(for: shown, info: i) }
+        var row: NSMutableAttributedString?
+        if let code = i.country {
+            let r = NSMutableAttributedString(string: "\(flag(code)) ", attributes: [.font: NSFont.systemFont(ofSize: 13)])
+            r.append(NSAttributedString(string: countryName(code), attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: NSColor.labelColor]))
+            row = r
+        }
+        var maps: NSButton?
+        if i.latitude != nil {
+            let b = NSButton(title: "Show in Maps",
+                             image: NSImage(systemSymbolName: "map.fill", accessibilityDescription: nil)!,
+                             target: self, action: #selector(showOnMap))
+            b.imagePosition = .imageLeading
+            b.bezelStyle = .push
+            b.controlSize = .small
+            b.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+            b.bezelColor = .controlAccentColor
+            b.contentTintColor = .white
+            b.toolTip = i.place ?? i.subject
+            b.sizeToFit()
+            maps = b
+        }
+        if row != nil || maps != nil {
+            let buttonWidth = maps.map { $0.frame.width + 8 } ?? 0
+            var rowHeight = maps?.frame.height ?? 0
+            if let row = row {
+                let (field, h) = text(row, width: cardWidth - buttonWidth, lines: 1)
+                rowHeight = max(rowHeight, h)
+                field.frame.origin = NSPoint(x: inset, y: y + (rowHeight - h) / 2)
+                view.addSubview(field)
             }
-            row.append(NSAttributedString(string: placeName, attributes: [
-                .font: NSFont.systemFont(ofSize: 12.5, weight: .medium), .foregroundColor: NSColor.labelColor]))
-            y = place(text(row, lines: 1), in: view, y: y, gap: 10)
+            if let b = maps {
+                b.frame.origin = NSPoint(x: inset + cardWidth - b.frame.width, y: y + (rowHeight - b.frame.height) / 2)
+                view.addSubview(b)
+            }
+            y += rowHeight + 10
         } else {
             y += 4
         }
@@ -832,62 +920,50 @@ final class MenuBar: NSObject, NSMenuDelegate {
                 .paragraphStyle: para])), in: view, y: y, gap: 14)
         }
 
-        // 5. Controls:  [‹ | ›]  [Today]                [📍 Show in Maps]
-        let line = NSBox(frame: NSRect(x: inset, y: y, width: cardWidth, height: 1))
-        line.boxType = .separator
-        view.addSubview(line)
-        y += 11
-
+        // 5. Bottom row:  [‹ | ›] [Today]          Postcard          2 of 8
         let arrows = NSSegmentedControl(images: [
             NSImage(systemSymbolName: "chevron.left", accessibilityDescription: "Previous day")!,
             NSImage(systemSymbolName: "chevron.right", accessibilityDescription: "Next day")!,
         ], trackingMode: .momentary, target: self, action: #selector(step(_:)))
+        arrows.controlSize = .small
         arrows.setToolTip("Previous day", forSegment: 0)
         arrows.setToolTip("Next day", forSegment: 1)
         arrows.setEnabled((pos ?? 0) > 0, forSegment: 0)
         arrows.setEnabled(pos.map { $0 < images.count - 1 } ?? false, forSegment: 1)
         arrows.sizeToFit()
+        let rowHeight = arrows.frame.height
+        if let height = height { y = max(y, height - (10 + rowHeight + 10)) }
+
+        let line = NSBox(frame: NSRect(x: inset, y: y, width: cardWidth, height: 1))
+        line.boxType = .separator
+        view.addSubview(line)
+        y += 10
         arrows.frame.origin = NSPoint(x: inset, y: y)
         view.addSubview(arrows)
-        var rowHeight = arrows.frame.height
 
         if !isToday {
             let back = NSButton(title: "Today", target: self, action: #selector(today))
             back.bezelStyle = .push
+            back.controlSize = .small
+            back.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
             back.toolTip = "Back to today's photo"
             back.sizeToFit()
-            back.frame.origin = NSPoint(x: arrows.frame.maxX + 8, y: y + (rowHeight - back.frame.height) / 2)
+            back.frame.origin = NSPoint(x: arrows.frame.maxX + 6, y: y + (rowHeight - back.frame.height) / 2)
             view.addSubview(back)
         }
-        if i.latitude != nil {
-            let maps = NSButton(title: "Show in Maps",
-                                image: NSImage(systemSymbolName: "map.fill", accessibilityDescription: nil)!,
-                                target: self, action: #selector(showOnMap))
-            maps.imagePosition = .imageLeading
-            maps.bezelStyle = .push
-            maps.bezelColor = .controlAccentColor
-            maps.contentTintColor = .white
-            maps.toolTip = i.place ?? i.subject
-            maps.sizeToFit()
-            maps.frame.origin = NSPoint(x: inset + cardWidth - maps.frame.width, y: y + (rowHeight - maps.frame.height) / 2)
-            rowHeight = max(rowHeight, maps.frame.height)
-            view.addSubview(maps)
-        }
-        y += rowHeight + 12
 
-        // 6. Footer.
-        let footerAttrs: [NSAttributedString.Key: Any] = [
+        let quiet: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.tertiaryLabelColor]
-        let (brand, bh) = text(NSAttributedString(string: "Postcard", attributes: footerAttrs), lines: 1)
-        brand.frame.origin = NSPoint(x: inset, y: y)
+        let (brand, bh) = text(NSAttributedString(string: "Postcard", attributes: quiet), width: 80, lines: 1, alignment: .center)
+        brand.frame.origin = NSPoint(x: inset + (cardWidth - 80) / 2, y: y + (rowHeight - bh) / 2)
         view.addSubview(brand)
         if let pos = pos {
-            let (count, _) = text(NSAttributedString(string: "\(pos + 1) of \(images.count)", attributes: footerAttrs),
-                                  width: 120, lines: 1, alignment: .right)
-            count.frame.origin = NSPoint(x: inset + cardWidth - 120, y: y)
+            let (count, ch) = text(NSAttributedString(string: "\(pos + 1) of \(images.count)", attributes: quiet),
+                                   width: 80, lines: 1, alignment: .right)
+            count.frame.origin = NSPoint(x: inset + cardWidth - 80, y: y + (rowHeight - ch) / 2)
             view.addSubview(count)
         }
-        y += bh + 8
+        y += rowHeight + 10
 
         view.frame = NSRect(x: 0, y: 0, width: cardWidth + inset * 2, height: y)
         return view
@@ -905,9 +981,15 @@ final class MenuBar: NSObject, NSMenuDelegate {
                       alignment: NSTextAlignment = .left) -> (NSTextField, CGFloat) {
         let w = width ?? cardWidth
         let field = NSTextField(wrappingLabelWithString: "")
-        field.attributedStringValue = s
+        // Alignment has to live in the attributed string; the field's own setting is ignored for it.
+        let aligned = NSMutableAttributedString(attributedString: s)
+        if alignment != .left {
+            let para = NSMutableParagraphStyle()
+            para.alignment = alignment
+            aligned.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: aligned.length))
+        }
+        field.attributedStringValue = aligned
         field.isSelectable = false
-        field.alignment = alignment
         field.maximumNumberOfLines = lines
         field.lineBreakMode = lines == 1 ? .byTruncatingTail : .byWordWrapping
         field.cell?.truncatesLastVisibleLine = true
@@ -921,6 +1003,23 @@ final class MenuBar: NSObject, NSMenuDelegate {
         let base = NSFont.systemFont(ofSize: size, weight: weight)
         guard let d = base.fontDescriptor.withDesign(.serif) else { return base }
         return NSFont(descriptor: d, size: size) ?? base
+    }
+
+    private var lookedUp: Set<String> = []
+
+    /// Finds the country from the photo's coordinates (once per photo), saves it, and refreshes
+    /// the menu if it's open. Only used when the caption doesn't name the country.
+    private func lookUpCountry(for file: String, info i: ImageInfo) {
+        guard let lat = i.latitude, let lon = i.longitude, lookedUp.insert(file).inserted else { return }
+        guard let request = MKReverseGeocodingRequest(location: CLLocation(latitude: lat, longitude: lon)) else { return }
+        request.getMapItems { [weak self] items, _ in
+            guard let code = items?.first?.addressRepresentations?.region?.identifier else { return }
+            var all = loadInfo()
+            all[file]?.countryCode = code
+            writeInfo(all)
+            guard let self = self, let menu = self.item.menu else { return }
+            RunLoop.main.perform(inModes: [.common, .eventTracking]) { self.menuNeedsUpdate(menu) }
+        }
     }
 
     /// A small copy of the photo for the menu (decoding the 4K original every time would be slow).
