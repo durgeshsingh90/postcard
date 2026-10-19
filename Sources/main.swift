@@ -8,6 +8,7 @@
 
 import AppKit
 import Foundation
+import ImageIO
 
 // MARK: - Constants
 
@@ -674,6 +675,11 @@ func refreshScreens() {
 
 // MARK: - Menu bar (watch mode only)
 
+/// Lays out top to bottom, like a page.
+final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class MenuBar: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let options: Options
@@ -699,97 +705,240 @@ final class MenuBar: NSObject, NSMenuDelegate {
     /// Rebuilt every time it opens, so it always reflects the latest image and position.
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        guard let s = loadState() else {
-            menu.addItem(label("Waiting for today's image…"))
-            return
+        let m = NSMenuItem()
+        if let s = loadState() {
+            m.view = card(for: s)
+        } else {
+            let (field, h) = text(NSAttributedString(string: "Waiting for today's photo…",
+                                  attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor]))
+            let view = FlippedView(frame: NSRect(x: 0, y: 0, width: cardWidth + inset * 2, height: h + 16))
+            field.frame.origin = NSPoint(x: inset, y: 8)
+            view.addSubview(field)
+            m.view = view
         }
+        menu.addItem(m)
+    }
+
+    // MARK: Card layout
+
+    private let cardWidth: CGFloat = 360
+    private let inset: CGFloat = 14
+    private var thumbnails: [String: CGImage] = [:]
+
+    /// Photo with title over it, date and credit, location, description, controls and footer.
+    /// Laid out top to bottom by hand; menus don't play well with Auto Layout.
+    private func card(for s: State) -> NSView {
         let shown = s.shownFile
         let i = info(for: shown)
         let images = history(s)
         let pos = images.firstIndex(of: shown)
+        let isToday = shown == s.file
+        let view = FlippedView(frame: .zero)
+        var y: CGFloat = 10
 
-        menu.addItem(label(i.subject, bold: true))
-        if let h = i.headline { menu.addItem(label("“\(h)”")) }
-        let todayTag = shown == s.file ? " · Today" : ""
-        menu.addItem(label([prettyDate(i.startdate) + todayTag, i.credit].compactMap { $0 }.joined(separator: "  ·  "), small: true))
-        if let about = i.about {
-            menu.addItem(.separator())
-            menu.addItem(paragraph(about))
-        }
-        menu.addItem(.separator())
-        menu.addItem(controls(canGoBack: (pos ?? 0) > 0,
-                              canGoForward: pos.map { $0 < images.count - 1 } ?? false,
-                              onToday: shown == s.file,
-                              place: i.latitude != nil ? (i.place ?? i.subject) : nil))
-        menu.addItem(.separator())
-        menu.addItem(label("Postcard \(toolVersion)", small: true))
-    }
+        // 1. The photo, with the headline and title on a soft gradient.
+        let eyebrowAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold), .kern: 0.8,
+        ]
+        let titleFont = serif(18, weight: .semibold)
+        if let thumb = thumbnail(for: shown) {
+            let photoHeight = (cardWidth * 9 / 16).rounded()
+            let photo = NSView(frame: NSRect(x: inset, y: y, width: cardWidth, height: photoHeight))
+            photo.wantsLayer = true
+            photo.layer?.contents = thumb
+            photo.layer?.contentsGravity = .resizeAspectFill
+            photo.layer?.cornerRadius = 12
+            photo.layer?.cornerCurve = .continuous
+            photo.layer?.masksToBounds = true
+            photo.layer?.borderWidth = 0.5
+            photo.layer?.borderColor = NSColor.black.withAlphaComponent(0.25).cgColor
 
-    /// One row of buttons:  [‹] [›] [Today]          [📍 Show in Maps]
-    /// Buttons in a menu item don't close the menu, so you can flip through days with it open.
-    private func controls(canGoBack: Bool, canGoForward: Bool, onToday: Bool, place: String?) -> NSMenuItem {
-        func button(_ symbol: String?, _ title: String, tip: String, _ sel: Selector, enabled: Bool = true) -> NSButton {
-            let b: NSButton
-            if let symbol = symbol, let img = NSImage(systemSymbolName: symbol, accessibilityDescription: tip) {
-                b = title.isEmpty ? NSButton(image: img, target: self, action: sel)
-                                  : NSButton(title: title, image: img, target: self, action: sel)
-                b.imagePosition = title.isEmpty ? .imageOnly : .imageLeading
-            } else {
-                b = NSButton(title: title, target: self, action: sel)
+            let shade = CAGradientLayer()
+            shade.frame = CGRect(x: 0, y: 0, width: cardWidth, height: photoHeight * 0.65)
+            shade.colors = [NSColor.black.withAlphaComponent(0.7).cgColor, NSColor.clear.cgColor]
+            shade.startPoint = CGPoint(x: 0.5, y: 0)   // layer y is bottom-up
+            shade.endPoint = CGPoint(x: 0.5, y: 1)
+            photo.layer?.addSublayer(shade)
+
+            let textWidth = cardWidth - 28
+            let shadow = NSShadow()
+            shadow.shadowBlurRadius = 4
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.6)
+            let (title, th) = text(NSAttributedString(string: i.subject, attributes: [
+                .font: titleFont, .foregroundColor: NSColor.white, .shadow: shadow]), width: textWidth, lines: 2)
+            // The photo view isn't flipped, so y counts up from its bottom edge.
+            title.frame.origin = NSPoint(x: 14, y: 12)
+            photo.addSubview(title)
+            if let h = i.headline {
+                var attrs = eyebrowAttrs
+                attrs[.foregroundColor] = NSColor.white.withAlphaComponent(0.85)
+                attrs[.shadow] = shadow
+                let (eyebrow, _) = text(NSAttributedString(string: h.uppercased(), attributes: attrs), width: textWidth, lines: 1)
+                eyebrow.frame.origin = NSPoint(x: 14, y: 12 + th + 2)
+                photo.addSubview(eyebrow)
             }
-            b.bezelStyle = .push
-            b.toolTip = tip
-            b.isEnabled = enabled
-            return b
+            view.addSubview(photo)
+            y += photoHeight + 12
+        } else {
+            if let h = i.headline {
+                var attrs = eyebrowAttrs
+                attrs[.foregroundColor] = NSColor.controlAccentColor
+                y = place(text(NSAttributedString(string: h.uppercased(), attributes: attrs), lines: 1), in: view, y: y, gap: 3)
+            }
+            y = place(text(NSAttributedString(string: i.subject, attributes: [
+                .font: titleFont, .foregroundColor: NSColor.labelColor]), lines: 3), in: view, y: y, gap: 8)
         }
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.spacing = 6
-        stack.setViews([
-            button("chevron.left", "", tip: "Previous day", #selector(previous), enabled: canGoBack),
-            button("chevron.right", "", tip: "Next day", #selector(nextDay), enabled: canGoForward),
-            button(nil, "Today", tip: "Back to today's image", #selector(today), enabled: !onToday),
-        ], in: .leading)
-        if let place = place {
-            stack.setViews([button("mappin.and.ellipse", "Show in Maps", tip: place, #selector(showOnMap))], in: .trailing)
+
+        // 2. Date (with a Today tag) and photographer credit.
+        let meta = NSMutableAttributedString(string: prettyDate(i.startdate), attributes: [
+            .font: NSFont.systemFont(ofSize: 11.5, weight: .medium), .foregroundColor: NSColor.secondaryLabelColor])
+        if isToday {
+            meta.append(NSAttributedString(string: "  TODAY", attributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .bold), .kern: 0.6,
+                .foregroundColor: NSColor.controlAccentColor]))
         }
-        let view = NSView(frame: NSRect(x: 0, y: 0, width: 368, height: 36))
-        stack.frame = view.bounds.insetBy(dx: 12, dy: 3)
-        stack.autoresizingMask = [.width, .height]
-        view.addSubview(stack)
-        let m = NSMenuItem()
-        m.view = view
-        return m
+        if let credit = i.credit {
+            meta.append(NSAttributedString(string: "   ·   \(credit)", attributes: [
+                .font: NSFont.systemFont(ofSize: 11.5), .foregroundColor: NSColor.tertiaryLabelColor]))
+        }
+        y = place(text(meta, lines: 1), in: view, y: y, gap: 6)
+
+        // 3. Location.
+        if let placeName = i.place {
+            let row = NSMutableAttributedString()
+            if let pin = NSImage(systemSymbolName: "mappin.circle.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold)
+                    .applying(.init(paletteColors: [.white, .systemRed]))) {
+                let a = NSTextAttachment()
+                a.image = pin
+                a.bounds = CGRect(x: 0, y: -2, width: pin.size.width, height: pin.size.height)
+                row.append(NSAttributedString(attachment: a))
+                row.append(NSAttributedString(string: " "))
+            }
+            row.append(NSAttributedString(string: placeName, attributes: [
+                .font: NSFont.systemFont(ofSize: 12.5, weight: .medium), .foregroundColor: NSColor.labelColor]))
+            y = place(text(row, lines: 1), in: view, y: y, gap: 10)
+        } else {
+            y += 4
+        }
+
+        // 4. The story.
+        if let about = i.about {
+            let para = NSMutableParagraphStyle()
+            para.lineHeightMultiple = 1.22
+            y = place(text(NSAttributedString(string: about, attributes: [
+                .font: NSFont.systemFont(ofSize: 12.5),
+                .foregroundColor: NSColor.labelColor.withAlphaComponent(0.82),
+                .paragraphStyle: para])), in: view, y: y, gap: 14)
+        }
+
+        // 5. Controls:  [‹ | ›]  [Today]                [📍 Show in Maps]
+        let line = NSBox(frame: NSRect(x: inset, y: y, width: cardWidth, height: 1))
+        line.boxType = .separator
+        view.addSubview(line)
+        y += 11
+
+        let arrows = NSSegmentedControl(images: [
+            NSImage(systemSymbolName: "chevron.left", accessibilityDescription: "Previous day")!,
+            NSImage(systemSymbolName: "chevron.right", accessibilityDescription: "Next day")!,
+        ], trackingMode: .momentary, target: self, action: #selector(step(_:)))
+        arrows.setToolTip("Previous day", forSegment: 0)
+        arrows.setToolTip("Next day", forSegment: 1)
+        arrows.setEnabled((pos ?? 0) > 0, forSegment: 0)
+        arrows.setEnabled(pos.map { $0 < images.count - 1 } ?? false, forSegment: 1)
+        arrows.sizeToFit()
+        arrows.frame.origin = NSPoint(x: inset, y: y)
+        view.addSubview(arrows)
+        var rowHeight = arrows.frame.height
+
+        if !isToday {
+            let back = NSButton(title: "Today", target: self, action: #selector(today))
+            back.bezelStyle = .push
+            back.toolTip = "Back to today's photo"
+            back.sizeToFit()
+            back.frame.origin = NSPoint(x: arrows.frame.maxX + 8, y: y + (rowHeight - back.frame.height) / 2)
+            view.addSubview(back)
+        }
+        if i.latitude != nil {
+            let maps = NSButton(title: "Show in Maps",
+                                image: NSImage(systemSymbolName: "map.fill", accessibilityDescription: nil)!,
+                                target: self, action: #selector(showOnMap))
+            maps.imagePosition = .imageLeading
+            maps.bezelStyle = .push
+            maps.bezelColor = .controlAccentColor
+            maps.contentTintColor = .white
+            maps.toolTip = i.place ?? i.subject
+            maps.sizeToFit()
+            maps.frame.origin = NSPoint(x: inset + cardWidth - maps.frame.width, y: y + (rowHeight - maps.frame.height) / 2)
+            rowHeight = max(rowHeight, maps.frame.height)
+            view.addSubview(maps)
+        }
+        y += rowHeight + 12
+
+        // 6. Footer.
+        let footerAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.tertiaryLabelColor]
+        let (brand, bh) = text(NSAttributedString(string: "Postcard", attributes: footerAttrs), lines: 1)
+        brand.frame.origin = NSPoint(x: inset, y: y)
+        view.addSubview(brand)
+        if let pos = pos {
+            let (count, _) = text(NSAttributedString(string: "\(pos + 1) of \(images.count)", attributes: footerAttrs),
+                                  width: 120, lines: 1, alignment: .right)
+            count.frame.origin = NSPoint(x: inset + cardWidth - 120, y: y)
+            view.addSubview(count)
+        }
+        y += bh + 8
+
+        view.frame = NSRect(x: 0, y: 0, width: cardWidth + inset * 2, height: y)
+        return view
     }
 
-    /// A line of text drawn as a view rather than a disabled menu item, which macOS would dim.
-    private func label(_ text: String, bold: Bool = false, small: Bool = false) -> NSMenuItem {
-        let font = bold ? NSFont.boldSystemFont(ofSize: 14)
-                        : NSFont.systemFont(ofSize: small ? 11.5 : 13)
-        return textItem(text, font: font, color: small ? .secondaryLabelColor : .labelColor, gap: 2)
+    /// Adds a text field at y and returns the y below it.
+    private func place(_ t: (NSTextField, CGFloat), in view: NSView, y: CGFloat, gap: CGFloat) -> CGFloat {
+        t.0.frame.origin = NSPoint(x: inset, y: y)
+        view.addSubview(t.0)
+        return y + t.1 + gap
     }
 
-    /// The description paragraph.
-    private func paragraph(_ text: String) -> NSMenuItem {
-        textItem(text, font: NSFont.systemFont(ofSize: 12.5), color: .labelColor, gap: 5)
-    }
-
-    /// Wrapped, full-contrast, non-clickable text.
-    private func textItem(_ text: String, font: NSFont, color: NSColor, gap: CGFloat) -> NSMenuItem {
-        let width: CGFloat = 340
-        let field = NSTextField(wrappingLabelWithString: text)
-        field.font = font
-        field.textColor = color
+    /// A non-selectable, wrapping label sized to its text.
+    private func text(_ s: NSAttributedString, width: CGFloat? = nil, lines: Int = 0,
+                      alignment: NSTextAlignment = .left) -> (NSTextField, CGFloat) {
+        let w = width ?? cardWidth
+        let field = NSTextField(wrappingLabelWithString: "")
+        field.attributedStringValue = s
         field.isSelectable = false
-        field.preferredMaxLayoutWidth = width
-        let size = field.sizeThatFits(NSSize(width: width, height: .greatestFiniteMagnitude))
-        let view = NSView(frame: NSRect(x: 0, y: 0, width: width + 28, height: size.height + gap * 2))
-        field.frame = NSRect(x: 14, y: gap, width: width, height: size.height)
-        view.addSubview(field)
-        let m = NSMenuItem()
-        m.view = view
-        return m
+        field.alignment = alignment
+        field.maximumNumberOfLines = lines
+        field.lineBreakMode = lines == 1 ? .byTruncatingTail : .byWordWrapping
+        field.cell?.truncatesLastVisibleLine = true
+        field.preferredMaxLayoutWidth = w
+        let h = ceil(field.sizeThatFits(NSSize(width: w, height: .greatestFiniteMagnitude)).height)
+        field.frame = NSRect(x: 0, y: 0, width: w, height: h)
+        return (field, h)
     }
+
+    private func serif(_ size: CGFloat, weight: NSFont.Weight) -> NSFont {
+        let base = NSFont.systemFont(ofSize: size, weight: weight)
+        guard let d = base.fontDescriptor.withDesign(.serif) else { return base }
+        return NSFont(descriptor: d, size: size) ?? base
+    }
+
+    /// A small copy of the photo for the menu (decoding the 4K original every time would be slow).
+    private func thumbnail(for file: String) -> CGImage? {
+        if let t = thumbnails[file] { return t }
+        let url = imagesDir.appendingPathComponent(file)
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let t = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceThumbnailMaxPixelSize: 900,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+              ] as CFDictionary) else { return nil }
+        if thumbnails.count > 12 { thumbnails.removeAll() }
+        thumbnails[file] = t
+        return t
+    }
+
+    @objc func step(_ sender: NSSegmentedControl) { go(sender.selectedSegment == 0 ? -1 : 1) }
 
     /// Steps, then refreshes the open menu in place (deferred: the clicked button is being replaced).
     private func go(_ step: Int) {
