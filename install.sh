@@ -5,7 +5,7 @@
 # No sudo needed. Re-run any time to upgrade.
 set -euo pipefail
 
-LABEL="com.durgesh.postcard"
+LABEL="local.postcard"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SUPPORT="$HOME/Library/Application Support/Postcard"
 BIN_DIR="$SUPPORT/bin"

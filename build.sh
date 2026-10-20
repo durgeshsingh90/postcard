@@ -11,8 +11,12 @@ if ! xcrun --find swiftc >/dev/null 2>&1; then
   exit 1
 fi
 
+# Runs on macOS 13 (Ventura) and later; the compiler rejects anything newer that isn't guarded.
+MIN_MACOS=13.0
+
 mkdir -p "$ROOT/build"
 xcrun swiftc -O -swift-version 5 \
+  -target "$(uname -m)-apple-macos$MIN_MACOS" \
   -framework AppKit \
   -framework CoreLocation \
   -framework MapKit \

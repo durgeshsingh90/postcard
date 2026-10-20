@@ -3,7 +3,7 @@
 # logs and settings. Your current wallpaper is left as it is.
 set -euo pipefail
 
-LABEL="com.durgesh.postcard"
+LABEL="local.postcard"
 SUPPORT="$HOME/Library/Application Support/Postcard"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/Postcard"

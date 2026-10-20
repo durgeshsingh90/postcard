@@ -36,14 +36,22 @@ updating either way.
 
 ## Install
 
-Requires the Xcode Command Line Tools (`xcode-select --install`).
+**Requirements**
+- macOS 13 Ventura or later (Apple silicon or Intel)
+- Xcode Command Line Tools: run `xcode-select --install` if you don't have them
 
 ```bash
-cd ~/Projects/Postcard
+git clone https://github.com/durgeshsingh90/postcard.git
+cd postcard
 ./install.sh
 ```
 
-This builds the binary, applies today's image right away, and registers the agent.
+This builds Postcard from source on your Mac, sets today's photo right away, and starts it in the
+background (at every login from now on). It installs for your user only and needs no password.
+macOS may show a "Background Items Added" notice; leave Postcard allowed in System Settings →
+General → Login Items & Extensions.
+
+To update later: `git pull && ./install.sh`.
 
 ## How it works
 
@@ -89,10 +97,10 @@ postcard --mkt en-US  # one-off run with a specific region
 Persistent settings:
 
 ```bash
-defaults write com.durgesh.postcard market en-GB        # pin a region (default: by your location)
-defaults write com.durgesh.postcard resolution 1920x1080 # default: UHD
-defaults write com.durgesh.postcard keep -int 60         # images kept on disk
-defaults delete com.durgesh.postcard market              # back to auto
+defaults write local.postcard market en-GB             # pin a region (default: by your location)
+defaults write local.postcard resolution 1920x1080     # default: UHD
+defaults write local.postcard keep -int 60             # images kept on disk
+defaults delete local.postcard market                  # back to auto
 ```
 
 Change the check interval with `POSTCARD_INTERVAL=1800 ./install.sh`.
@@ -107,7 +115,7 @@ downloaded, so ‹ › browses both. If no suitable space picture can be found, 
 
 ```bash
 postcard --space                                             # a space picture right now
-defaults write com.durgesh.postcard spaceChance -float 0.5   # more space days (0 = never, 1 = always)
+defaults write local.postcard spaceChance -float 0.5   # more space days (0 = never, 1 = always)
 ```
 
 ## Multiple Spaces and Sidecar
@@ -122,7 +130,7 @@ To avoid that flash, also turn on **System Settings → Wallpaper → Show on al
 |---|---|
 | Binary | `~/Library/Application Support/Postcard/bin/postcard` |
 | Images + state | `~/Library/Application Support/Postcard/` |
-| LaunchAgent | `~/Library/LaunchAgents/com.durgesh.postcard.plist` |
+| LaunchAgent | `~/Library/LaunchAgents/local.postcard.plist` |
 | Logs | `~/Library/Logs/Postcard/postcard.log` |
 
 ## Uninstall
@@ -133,3 +141,7 @@ To avoid that flash, also turn on **System Settings → Wallpaper → Show on al
 ```
 
 The photos belong to their photographers and are for personal wallpaper use only. Don't redistribute them.
+
+## License
+
+The code is released under the [MIT License](LICENSE).

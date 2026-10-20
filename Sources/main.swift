@@ -15,7 +15,7 @@ import MapKit
 // MARK: - Constants
 
 let toolVersion = "1.4.0"
-let defaultsDomain = "com.durgesh.postcard"
+let defaultsDomain = "local.postcard"
 let fm = FileManager.default
 let home = fm.homeDirectoryForCurrentUser
 let supportDir = home.appendingPathComponent("Library/Application Support/Postcard", isDirectory: true)
@@ -149,7 +149,7 @@ enum BWError: Error, CustomStringConvertible {
     }
 }
 
-// MARK: - Options (CLI flags override `defaults write com.durgesh.postcard ...`)
+// MARK: - Options (CLI flags override `defaults write local.postcard ...`)
 
 struct Options {
     var force = false
@@ -868,6 +868,26 @@ func refreshScreens() {
     do { try apply(current, to: stale) } catch { fail("Apply failed: \(error)") }
 }
 
+// MARK: - Country lookup from coordinates
+
+/// MapKit's lookup on macOS 26 and later; Core Location's (deprecated there) on older systems.
+/// The `compiler` check lets it build with older Xcode versions whose SDK lacks the new API.
+func countryCode(at location: CLLocation, done: @escaping (String?) -> Void) {
+    #if compiler(>=6.2)
+    if #available(macOS 26, *) {
+        guard let request = MKReverseGeocodingRequest(location: location) else { return done(nil) }
+        request.getMapItems { items, _ in done(items?.first?.addressRepresentations?.region?.identifier) }
+        return
+    }
+    #endif
+    legacyCountryCode(at: location, done: done)
+}
+
+@available(macOS, deprecated: 26.0)
+func legacyCountryCode(at location: CLLocation, done: @escaping (String?) -> Void) {
+    CLGeocoder().reverseGeocodeLocation(location) { marks, _ in done(marks?.first?.isoCountryCode) }
+}
+
 // MARK: - Menu bar (watch mode only)
 
 /// Lays out top to bottom, like a page.
@@ -1166,9 +1186,8 @@ final class MenuBar: NSObject, NSMenuDelegate {
     /// the menu if it's open. Only used when the caption doesn't name the country.
     private func lookUpCountry(for file: String, info i: ImageInfo) {
         guard let lat = i.latitude, let lon = i.longitude, lookedUp.insert(file).inserted else { return }
-        guard let request = MKReverseGeocodingRequest(location: CLLocation(latitude: lat, longitude: lon)) else { return }
-        request.getMapItems { [weak self] items, _ in
-            guard let code = items?.first?.addressRepresentations?.region?.identifier else { return }
+        countryCode(at: CLLocation(latitude: lat, longitude: lon)) { [weak self] code in
+            guard let code = code else { return }
             var all = loadInfo()
             all[file]?.countryCode = code
             writeInfo(all)
