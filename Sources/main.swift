@@ -93,6 +93,7 @@ struct ImageInfo: Codable {
     var longitude: Double? = nil
     var caption: String? = nil     // e.g. "Grand Canal in Venice, Italy"
     var countryCode: String? = nil // looked up from the coordinates when the caption doesn't say
+    var space: Bool? = nil         // a NASA space picture rather than a place
 
     /// What's in the photo: the caption, or "Grand Canal in Venice, Italy (© …)" without the credit.
     var subject: String {
@@ -159,6 +160,8 @@ struct Options {
     var watch = false              // stay resident (LaunchAgent mode)
     var step: Int? = nil           // --prev (-1), --next (+1), --today (0)
     var interval: TimeInterval = 3600
+    var space: Bool? = nil         // true = a space picture now (--space); nil = random space days
+    var spaceChance = 0.25         // share of days that are space days
 }
 
 func usage() -> String {
@@ -172,6 +175,7 @@ func usage() -> String {
       -p, --prev          Show the previous day's image (up to the images kept on disk)
       -n, --next          Show the next day's image
       -t, --today         Go back to today's image
+          --space         Show a NASA space picture now (galaxies, nebulae, stars)
       -m, --mkt CODE      Region, e.g. en-GB, en-US, en-IN (default: auto by IP)
       -r, --resolution R  UHD (default) or 1920x1080
       -k, --keep N        Number of images to keep on disk (default 30)
@@ -185,6 +189,7 @@ func usage() -> String {
       defaults write \(defaultsDomain) market en-GB
       defaults write \(defaultsDomain) resolution 1920x1080
       defaults write \(defaultsDomain) keep -int 60
+      defaults write \(defaultsDomain) spaceChance -float 0.25   (0 = never, 1 = every day)
       defaults delete \(defaultsDomain) market
     """
 }
@@ -195,6 +200,7 @@ func parseOptions() -> Options {
         if let m = d.string(forKey: "market"), !m.isEmpty { o.market = m }
         if let r = d.string(forKey: "resolution"), !r.isEmpty { o.resolution = r }
         let k = d.integer(forKey: "keep"); if k > 0 { o.keep = k }
+        if d.object(forKey: "spaceChance") != nil { o.spaceChance = min(max(d.double(forKey: "spaceChance"), 0), 1) }
     }
     var args = Array(CommandLine.arguments.dropFirst())
     func value(_ flag: String) -> String {
@@ -209,6 +215,7 @@ func parseOptions() -> Options {
         case "-p", "--prev", "--previous": o.step = -1
         case "-n", "--next": o.step = 1
         case "-t", "--today": o.step = 0
+        case "--space": o.space = true; o.force = true
         case "-m", "--mkt", "--market": o.market = value(a)
         case "-r", "--resolution": o.resolution = value(a)
         case "-k", "--keep":
@@ -436,6 +443,131 @@ func writeInfo(_ info: [String: ImageInfo]) {
     try? e.encode(info).write(to: infoFile, options: .atomic)
 }
 
+// MARK: - Space pictures (NASA Image and Video Library)
+
+/// Titles that say nothing about the picture.
+let genericSpaceTitles: Set<String> = ["space science", "hubble space telescope", "astronomy", "hubble image",
+                                       "james webb space telescope", "spitzer space telescope", "chandra x-ray observatory"]
+
+/// A space picture has to be about one of these (not a launch, a rocket or a diagram).
+let starryWords = "galax|nebula|star cluster|globular|milky way|supernova|stellar|starfield|stars"
+/// Pictures *of* telescopes and missions rather than *through* them.
+let notStarryWords = "launch|rocket|deploy|mirror|assembly|engineer|technician|clean ?room|ceremony|briefing|astronaut|spacecraft|test|transport|unboxing|install"
+
+let spaceTopics = ["galaxy hubble", "spiral galaxy", "nebula", "star cluster", "milky way",
+                   "webb galaxy", "supernova remnant"]
+
+struct NASASearch: Decodable {
+    struct Collection: Decodable { let items: [Item] }
+    struct Item: Decodable { let href: String; let data: [Meta] }
+    struct Meta: Decodable { let nasa_id: String; let title: String?; let description: String?; let media_type: String? }
+    let collection: Collection
+}
+
+/// Whether a date is a space day. Random, but the same answer all day so hourly checks agree.
+func isSpaceDay(_ startdate: String, chance: Double) -> Bool {
+    guard chance > 0 else { return false }
+    var h: UInt64 = 14_695_981_039_346_656_037   // FNV-1a
+    for b in "postcard-space-\(startdate)".utf8 { h = (h ^ UInt64(b)) &* 1_099_511_628_211 }
+    return Double(h % 10_000) / 10_000 < chance
+}
+
+func httpsURL(_ s: String) -> URL? { URL(string: s.replacingOccurrences(of: "http://", with: "https://")) }
+
+/// Size of a file before downloading it, so huge originals can be skipped.
+func contentLength(_ url: URL) -> Int? {
+    var req = URLRequest(url: url)
+    req.httpMethod = "HEAD"
+    let sem = DispatchSemaphore(value: 0)
+    let box = Box<Int>()
+    session.dataTask(with: req) { _, resp, _ in
+        if let http = resp as? HTTPURLResponse, http.expectedContentLength > 0 { box.value = Int(http.expectedContentLength) }
+        sem.signal()
+    }.resume()
+    sem.wait()
+    return box.value
+}
+
+/// Pixel size, read from the file header without decoding the image.
+func pixelSize(_ data: Data) -> (width: Int, height: Int)? {
+    guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+          let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int else { return nil }
+    return (w, h)
+}
+
+/// NASA descriptions are lightly HTML'd and end with "Credit: …". Returns readable text (kept to
+/// a few sentences so the menu card stays a sensible size) and the credit.
+func cleanDescription(_ raw: String) -> (about: String, credit: String?) {
+    var text = raw.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+    for (entity, char) in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&#39;", "'"), ("&nbsp;", " ")] {
+        text = text.replacingOccurrences(of: entity, with: char)
+    }
+    var credit: String?
+    if let r = text.range(of: "Credit:", options: [.caseInsensitive, .backwards]) {
+        var c = text[r.upperBound...].components(separatedBy: .newlines).first ?? ""
+        if let ack = c.range(of: "Acknowledg", options: .caseInsensitive) { c = String(c[..<ack.lowerBound]) }
+        c = c.trimmingCharacters(in: CharacterSet(charactersIn: " .;,()"))
+        credit = c.count > 70 ? String(c.prefix(69)) + "…" : c
+        text = String(text[..<r.lowerBound])
+    }
+    text = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        .trimmingCharacters(in: .whitespaces)
+    if text.count > 560 {
+        let cut = text.prefix(560)
+        if let end = cut.range(of: ". ", options: .backwards), cut.distance(from: cut.startIndex, to: end.lowerBound) > 200 {
+            text = String(cut[..<end.lowerBound]) + "."
+        } else {
+            text = cut.trimmingCharacters(in: .whitespaces) + "…"
+        }
+    }
+    return (text, credit?.isEmpty == false ? credit : nil)
+}
+
+/// Finds a landscape galaxy, nebula or star picture big enough for a desktop, downloads it and
+/// records its details. Returns the file name.
+func fetchSpacePicture(date: String, resolution: String) throws -> String {
+    for topic in spaceTopics.shuffled().prefix(3) {
+        var c = URLComponents(string: "https://images-api.nasa.gov/search")!
+        c.queryItems = [URLQueryItem(name: "q", value: topic), URLQueryItem(name: "media_type", value: "image"),
+                        URLQueryItem(name: "page_size", value: "50"), URLQueryItem(name: "page", value: String(Int.random(in: 1...3)))]
+        guard let data = try? getWithRetry(c.url!, attempts: 2),
+              let found = try? JSONDecoder().decode(NASASearch.self, from: data) else { continue }
+        for item in found.collection.items.shuffled().prefix(6) {
+            guard let meta = item.data.first, meta.media_type == "image",
+                  let title = meta.title, title.count >= 12,
+                  !genericSpaceTitles.contains(title.lowercased()),
+                  title.range(of: "^[A-Z0-9]+[-_][0-9]", options: .regularExpression) == nil,  // "KSC-2009-1127"
+                  !["NHQ", "KSC", "JSC", "AFRC", "MSFC"].contains(where: meta.nasa_id.hasPrefix),       // event photography
+                  title.range(of: notStarryWords, options: [.regularExpression, .caseInsensitive]) == nil,
+                  "\(title) \(meta.description ?? "")".range(of: starryWords, options: [.regularExpression, .caseInsensitive]) != nil,
+                  let listURL = httpsURL(item.href),
+                  let list = try? getWithRetry(listURL, attempts: 2),
+                  let files = try? JSONDecoder().decode([String].self, from: list) else { continue }
+            let sizes = ["~orig.jpg", "~large.jpg"].compactMap { size in files.first { $0.hasSuffix(size) } }
+            for url in sizes.compactMap(httpsURL) {
+                if let length = contentLength(url), length > 40_000_000 { continue }
+                guard let image = try? getWithRetry(url, attempts: 2), image.count >= 300_000, looksLikeImage(image),
+                      let size = pixelSize(image), size.width >= 1900,
+                      Double(size.width) / Double(size.height) >= 1.4 else { continue }   // wide enough to crop well
+                let id = String(String.UnicodeScalarView(meta.nasa_id.unicodeScalars.map {
+                    CharacterSet.alphanumerics.contains($0) ? $0 : "_" })).prefix(80)
+                let name = "\(date)_Space.\(id)_\(resolution).jpg"   // sorts after that day's place photo
+                try image.write(to: imagesDir.appendingPathComponent(name), options: .atomic)
+                let (about, credit) = cleanDescription(meta.description ?? "")
+                var all = loadInfo()
+                all[name] = ImageInfo(startdate: date, title: "From NASA's archive",
+                                      copyright: "\(meta.title ?? "Space") (© \(credit ?? "NASA"))", link: nil,
+                                      about: about.isEmpty ? nil : about, caption: meta.title, space: true)
+                writeInfo(all)
+                log("Downloaded space picture \(name) (\(image.count / 1024) KB, \(size.width)×\(size.height))")
+                return name
+            }
+        }
+    }
+    throw BWError.noImages
+}
+
 // MARK: - Country
 
 /// English country names (and a few common alternatives) -> ISO code.
@@ -625,17 +757,33 @@ func update(_ o: Options) -> Int32 {
         }
     }
 
-    let name = fileName(for: meta, resolution: o.resolution)
-    let file = imagesDir.appendingPathComponent(name)
-    if !fm.fileExists(atPath: file.path) {
+    // The day's place photo is always downloaded, so it can be browsed even on a space day.
+    let placeName = fileName(for: meta, resolution: o.resolution)
+    let placeFile = imagesDir.appendingPathComponent(placeName)
+    var placeError: Error?
+    if !fm.fileExists(atPath: placeFile.path) {
         do {
             let data = try downloadImage(meta, resolution: o.resolution)
-            try data.write(to: file, options: .atomic) // temp file + rename: never a half-written wallpaper
-            log("Downloaded \(name) (\(data.count / 1024) KB)")
+            try data.write(to: placeFile, options: .atomic) // temp file + rename: never a half-written wallpaper
+            log("Downloaded \(placeName) (\(data.count / 1024) KB)")
         } catch {
-            fail("Download failed: \(error)"); return 1
+            placeError = error
         }
     }
+
+    var name = placeName
+    if o.space ?? isSpaceDay(meta.startdate, chance: o.spaceChance) {
+        // Reuse today's space picture if an earlier run got it but couldn't apply it.
+        let earlier = localImages().last { $0.hasPrefix("\(meta.startdate)_Space.") && $0.hasSuffix("_\(o.resolution).jpg") }
+        if let earlier = earlier, o.space == nil {
+            name = earlier
+        } else {
+            do { name = try fetchSpacePicture(date: meta.startdate, resolution: o.resolution) }
+            catch { warn("No space picture found (\(error)); showing today's place instead") }
+        }
+    }
+    if name == placeName, let error = placeError { fail("Download failed: \(error)"); return 1 }
+    let file = imagesDir.appendingPathComponent(name)
 
     do {
         try apply(file, to: NSScreen.screens)
@@ -648,7 +796,7 @@ func update(_ o: Options) -> Int32 {
                          title: meta.title, copyright: meta.copyright, market: o.market,
                          resolution: o.resolution, appliedAt: Date())
     do { try saveState(newState) } catch { warn("Could not save state: \(error)") }
-    log("Today: \(meta.title ?? "-") — \(meta.copyright ?? "")")
+    log("Today: \(info(for: name).subject)")
     backfill(recent.dropFirst(), resolution: o.resolution)
     prune(keep: o.keep, protecting: name)
     saveInfo(for: recent, resolution: o.resolution, market: o.market)
@@ -871,7 +1019,14 @@ final class MenuBar: NSObject, NSMenuDelegate {
         //    🇭🇷 Croatia                                        [Show in Maps]
         if i.country == nil, i.latitude != nil { lookUpCountry(for: shown, info: i) }
         var row: NSMutableAttributedString?
-        if let code = i.country {
+        if i.space == true {
+            let r = NSMutableAttributedString(string: "🌌 ", attributes: [.font: NSFont.systemFont(ofSize: 13)])
+            r.append(NSAttributedString(string: "Space", attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: NSColor.labelColor]))
+            r.append(NSAttributedString(string: "  ·  NASA", attributes: [
+                .font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: NSColor.secondaryLabelColor]))
+            row = r
+        } else if let code = i.country {
             let r = NSMutableAttributedString(string: "\(flag(code)) ", attributes: [.font: NSFont.systemFont(ofSize: 13)])
             r.append(NSAttributedString(string: countryName(code), attributes: [
                 .font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: NSColor.labelColor]))

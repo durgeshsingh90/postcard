@@ -13,6 +13,8 @@ or flip back through the past week's photos.
 - **Look back.** Use ‹ › to browse the past week's photos, or jump back to today.
 - **Stays out of your way.** It lives in the menu bar, with no Dock icon and no windows. Once the day's photo is set, it doesn't go online again until tomorrow.
 - **Respects your choices.** If you set your own photo on a desktop, Postcard leaves it alone.
+- **Space days.** Now and then, the day's postcard comes from much further away: a galaxy, nebula or
+  star field from NASA's archive.
 
 Postcard is lightweight and private: no accounts, no tracking, no data collected.
 
@@ -80,6 +82,7 @@ postcard --force      # re-download and re-apply to all screens
 postcard --prev       # previous day's image (-p)
 postcard --next       # next day's image (-n)
 postcard --today      # back to today's image (-t)
+postcard --space      # a NASA space picture now
 postcard --mkt en-US  # one-off run with a specific region
 ```
 
@@ -93,6 +96,19 @@ defaults delete com.durgesh.postcard market              # back to auto
 ```
 
 Change the check interval with `POSTCARD_INTERVAL=1800 ./install.sh`.
+
+## Space days
+
+About one day in four (picked at random, but fixed for each date) the wallpaper is a space picture
+from the [NASA Image and Video Library](https://images.nasa.gov): Hubble and Webb galaxies, nebulae,
+star clusters and the Milky Way. It only uses wide landscape images at least 1900 px across, and the
+menu shows "🌌 Space · NASA" with NASA's description and credit. That day's place photo is still
+downloaded, so ‹ › browses both. If no suitable space picture can be found, the place is shown.
+
+```bash
+postcard --space                                             # a space picture right now
+defaults write com.durgesh.postcard spaceChance -float 0.5   # more space days (0 = never, 1 = always)
+```
 
 ## Multiple Spaces and Sidecar
 
